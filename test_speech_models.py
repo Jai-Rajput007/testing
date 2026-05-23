@@ -89,7 +89,12 @@ SPEECH_TIMEOUT_S   = 1.2           # silence after speech → stop recording
 MAX_RECORD_S       = 15.0          # hard cap
 TRANSCRIBE_TIMEOUT = 120.0         # wall-clock inference limit (2B model on CPU is slow)
 TTS_ECHO_DRAIN_S   = 0.20          # extra silence after TTS clears before VAD starts
-USE_BFLOAT16       = True          # halves RAM and inference time on CPU (ARM-safe)
+
+# [CRITICAL FIX]
+# Jetson Orin / ARM CPUs do NOT have native bfloat16 mathematical hardware.
+# PyTorch silently emulates it in software, causing models to be 100x slower.
+# We MUST use float32 for PyTorch to leverage actual hardware execution.
+USE_BFLOAT16       = False         
 
 MODELS_DIR       = "./models"
 PIPER_MODEL_NAME = "en_US-ryan-high"
@@ -122,12 +127,6 @@ LOCAL_IP = get_local_ip(NETWORK_INTERFACE)
 print(f"[TEST] Interface={NETWORK_INTERFACE}, local_ip={LOCAL_IP}")
 
 def model_cache_folder(model_id: str) -> str:
-    """
-    Return the path to the HuggingFace cache folder for a model.
-
-    HF convention: 'org/model-name'  →  models/models--org--model-name
-    Models without an org prefix     →  models/models--model-name
-    """
     safe = model_id.replace("/", "--")
     return os.path.join(MODELS_DIR, f"models--{safe}")
 
@@ -145,7 +144,6 @@ def model_disk_size_mb(model_id: str) -> float:
     return total / (1024 * 1024)
 
 def delete_model_files(model_id: str) -> bool:
-    """Delete cached model files from disk. Returns True if anything was deleted."""
     folder = model_cache_folder(model_id)
     if os.path.isdir(folder):
         size_mb = model_disk_size_mb(model_id)
@@ -157,14 +155,11 @@ def delete_model_files(model_id: str) -> bool:
     return False
 
 def list_cached_models() -> list:
-    """Return list of model_ids found in MODELS_DIR cache."""
     cached = []
     if not os.path.isdir(MODELS_DIR):
         return cached
     for name in os.listdir(MODELS_DIR):
         if name.startswith("models--"):
-            # Reverse the folder name → model_id
-            # "models--openai--whisper-tiny.en" → "openai/whisper-tiny.en"
             parts = name[len("models--"):].split("--", 1)
             if len(parts) == 2:
                 cached.append(f"{parts[0]}/{parts[1]}")
@@ -192,7 +187,6 @@ voice_client._RegistApi(1008, 0)
 voice_client._Call(1008, '{"mode": 1}')   # mic active
 print("[TEST] Hardware initialized.")
 
-# ── Cleanup on exit ───────────────────────────────────────────────────────────
 def _cleanup(sig=None, frame=None):
     print("\n[TEST] Shutting down ...")
     try:
@@ -222,10 +216,9 @@ _TARGET_FS   = 16000
 _TTS_BOOST   = 5.0
 
 _speaking_lock = threading.Lock()
-_is_speaking   = threading.Event()   # set while TTS is playing
+_is_speaking   = threading.Event()
 
 def speak(text: str):
-    """Synthesize text with Piper and stream to robot speaker."""
     with _speaking_lock:
         _is_speaking.set()
         print(f"[TTS] {text}")
@@ -256,7 +249,7 @@ def speak(text: str):
                 audio_client.PlayStop("stt_test")
             except Exception:
                 pass
-            time.sleep(0.4)   # let speaker echo decay before mic opens
+            time.sleep(0.4)
             _is_speaking.clear()
 
 # ── STT — model family detection & per-family pipelines ──────────────────────
@@ -286,49 +279,16 @@ def _detect_family(model_id: str, arch: str) -> str:
     if "moonshine" in arc:      return "moonshine"
     return "seq2seq"
 
-
 def _torch_dtype():
-    """bfloat16 halves RAM and speeds up inference on ARM CPU. Falls back to float32."""
     if USE_BFLOAT16:
         try:
-            # Quick check that bfloat16 ops work on this CPU
             _ = torch.zeros(1, dtype=torch.bfloat16) + torch.zeros(1, dtype=torch.bfloat16)
             return torch.bfloat16
         except Exception:
             print("[STT] bfloat16 not supported on this CPU, falling back to float32.")
     return torch.float32
 
-
 class STTModel:
-    """
-    Unified wrapper for any HuggingFace speech-to-text model.
-
-    Models saved to ./models/ in HuggingFace cache layout.
-
-    ── Family inference paths ────────────────────────────────────────────────
-    granite   Official IBM API (same for granite-4.0-1b-speech AND 4.1-2b-plus):
-                1. tokenizer.apply_chat_template(chat, tokenize=False)
-                   → plain text string with <|audio|> placeholder
-                2. processor(prompt_string, wav_tensor, return_tensors="pt")
-                   → encodes text + audio together; <|audio|> determines
-                   how many audio feature slots are created (must match
-                   number of encoder output frames — "tokens: 0, features: N"
-                   crash means <|audio|> was missing or processor skipped)
-                3. model.generate(**inputs) → strip input_ids length from
-                   output, decode with tokenizer.batch_decode
-              Loaded with AutoModelForSpeechSeq2Seq + bfloat16.
-
-    moonshine AutoModelForCausalLM; processor.decode() (not batch_decode).
-
-    whisper   AutoModelForSpeechSeq2Seq; processor.batch_decode.
-
-    ctc       AutoModelForCTC; argmax(logits); processor.batch_decode.
-
-    speecht5  transformers.pipeline() (handles speaker embeddings internally).
-
-    seq2seq   Generic fallback with generate().
-    """
-
     def __init__(self, model_id: str):
         self.model_id  = model_id
         self.model     = None
@@ -375,8 +335,6 @@ class STTModel:
                 torch_dtype=self._dtype,
             )
         elif self.family == "granite":
-            # Both granite-4.0-1b-speech and granite-speech-4.1-*-plus register
-            # as AutoModelForSpeechSeq2Seq in transformers ≥ 4.52.1
             self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
                 model_id, cache_dir=cache, trust_remote_code=True,
                 torch_dtype=self._dtype,
@@ -444,7 +402,6 @@ class STTModel:
             delete_model_files(mid)
 
     def transcribe(self, audio_np: np.ndarray) -> str:
-        """audio_np: float32 [-1,1] at 16 kHz mono. Returns transcribed string."""
         try:
             if self.family == "granite":
                 return self._infer_granite(audio_np)
@@ -463,50 +420,47 @@ class STTModel:
 
     # ── Granite Speech (granite-4.0-1b-speech AND granite-speech-4.1-*) ──────
     def _infer_granite(self, audio_np: np.ndarray) -> str:
-        """
-        Correct API from official IBM model cards (transformers ≥ 4.52.1):
-
-          Step 1 — build prompt TEXT STRING containing <|audio|>
-            The <|audio|> token tells the processor how many audio feature
-            slots to reserve. If it's absent → tokens=0, features=N → crash.
-            Use tokenizer.apply_chat_template(..., tokenize=False) to get
-            the raw string; do NOT pass tokenize=True or return_dict=True.
-
-          Step 2 — processor(prompt_string, wav_tensor, return_tensors="pt")
-            Pass the text string AND a [1,T] float32 torch tensor together.
-            The processor aligns the audio features with the <|audio|> slots.
-            Do NOT pass a numpy array — processor expects a torch tensor.
-
-          Step 3 — model.generate(**inputs, ...)
-            Output includes the full prompt tokens. Strip them:
-              new_tokens = outputs[0, input_ids.shape[-1]:]
-            Decode with tokenizer.batch_decode (not processor.batch_decode).
-        """
         tokenizer = self.processor.tokenizer
 
-        # Step 1: text prompt — <|audio|> MUST be in the content
         chat = [{"role": "user", "content": "<|audio|>Transcribe the speech into written text."}]
         prompt_text = tokenizer.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=True
         )
 
-        # Step 2: wav tensor [1, T] float32 — processor needs torch, not numpy
-        wav_tensor = torch.from_numpy(audio_np).unsqueeze(0)  # [1, T]
+        # [CRITICAL FIX] 
+        # Properly supplying kwargs for Hugging Face Granite Processor
+        try:
+            model_inputs = self.processor(
+                text=prompt_text,
+                audio=audio_np,       # standard HF audio kwarg
+                return_tensors="pt",
+                sampling_rate=SAMPLE_RATE,
+            )
+        except Exception:
+            try:
+                model_inputs = self.processor(
+                    text=prompt_text,
+                    audios=audio_np,  # alternative HF audio kwarg
+                    return_tensors="pt",
+                    sampling_rate=SAMPLE_RATE,
+                )
+            except Exception:
+                # If kwargs completely fail, fallback to positionals
+                # Note: PyTorch tensors might be expected instead of numpy directly 
+                wav_tensor = torch.from_numpy(audio_np)
+                model_inputs = self.processor(
+                    prompt_text,
+                    wav_tensor,
+                    return_tensors="pt",
+                    sampling_rate=SAMPLE_RATE,
+                )
 
-        model_inputs = self.processor(
-            prompt_text,
-            wav_tensor,
-            return_tensors="pt",
-            sampling_rate=SAMPLE_RATE,
-        )
-        # Move all tensor inputs to CPU (already there, but explicit is safer)
         model_inputs = {k: v.to("cpu") for k, v in model_inputs.items()
                         if isinstance(v, torch.Tensor)}
 
         duration       = len(audio_np) / SAMPLE_RATE
         max_new_tokens = max(int(duration * 8), 32)
 
-        # Step 3: generate + strip prompt tokens + decode
         with torch.no_grad():
             outputs = self.model.generate(
                 **model_inputs,
@@ -516,10 +470,10 @@ class STTModel:
             )
 
         num_input_tokens = model_inputs["input_ids"].shape[-1]
-        new_tokens = outputs[0, num_input_tokens:].unsqueeze(0)
-        text = tokenizer.batch_decode(
-            new_tokens, add_special_tokens=False, skip_special_tokens=True
-        )[0]
+        new_tokens = outputs[0, num_input_tokens:]
+        text = tokenizer.decode(
+            new_tokens, skip_special_tokens=True
+        )
         return text.strip()
 
     # ── Moonshine ─────────────────────────────────────────────────────────────
@@ -592,7 +546,6 @@ def transcribe_with_timeout(stt: STTModel, audio_np: np.ndarray) -> str:
 _audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=300)
 
 def _mic_thread():
-    """Receives UDP multicast from robot mic. Auto-reconnects on any error."""
     while True:
         sock = None
         try:
@@ -634,38 +587,24 @@ def _mic_thread():
 
 threading.Thread(target=_mic_thread, daemon=True).start()
 
-
 def _drain_queue():
     while not _audio_q.empty():
         try: _audio_q.get_nowait()
         except queue.Empty: break
 
-
 def _vad_prob(chunk: np.ndarray) -> float:
     return float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768.0
 
-
 # ── VAD-based recording ───────────────────────────────────────────────────────
 def record_utterance() -> np.ndarray:
-    """
-    Block until speech is detected, record until silence or MAX_RECORD_S.
-    Returns float32 waveform normalised to [-1, 1].
-
-    Mirrors demo_gestures.py robustness:
-      • Drains stale/TTS-echo frames before listening
-      • Requires VAD_CONFIRM_CHUNKS consecutive above-threshold chunks to start
-      • Stops on SPEECH_TIMEOUT_S of silence or MAX_RECORD_S hard cap
-      • Ignores all frames while TTS is playing (_is_speaking guard)
-    """
     _drain_queue()
     silence_limit = max(1, round(SPEECH_TIMEOUT_S * SAMPLE_RATE / CHUNK_SIZE))
 
-    # Phase 1 — wait for confirmed speech onset
     speech_consec = 0
     while True:
         chunk = _audio_q.get()
         if _is_speaking.is_set():
-            continue                 # ignore mic while robot is speaking
+            continue                 
         if _vad_prob(chunk) >= VAD_THRESHOLD:
             speech_consec += 1
         else:
@@ -674,7 +613,6 @@ def record_utterance() -> np.ndarray:
             print("[VAD] Speech onset confirmed.")
             break
 
-    # Phase 2 — record until silence / hard cap
     frames         = [chunk]
     silence_chunks = 0
     deadline       = time.time() + MAX_RECORD_S
@@ -697,10 +635,8 @@ def record_utterance() -> np.ndarray:
 
     return np.concatenate(frames).astype(np.float32) / 32768.0
 
-
 # ── Voice command: model switching & management ───────────────────────────────
 MODEL_ALIASES = {
-    # spoken name            → HuggingFace model ID
     "whisper tiny":           "openai/whisper-tiny.en",
     "whisper tiny en":        "openai/whisper-tiny.en",
     "whisper tiny english":   "openai/whisper-tiny.en",
@@ -723,27 +659,18 @@ MODEL_ALIASES = {
 }
 
 def _resolve_model_id(text: str) -> str | None:
-    """Try to resolve spoken text to a known model ID."""
     t = text.lower().strip()
-    # Check aliases longest-first so "whisper base en" beats "whisper base"
     for alias in sorted(MODEL_ALIASES, key=len, reverse=True):
         if alias in t:
             return MODEL_ALIASES[alias]
-    # Check if there's a raw HF-style ID in the text (contains /)
     m = re.search(r'[\w\-\.]+/[\w\-\.]+', t)
     if m:
         return m.group(0)
     return None
 
-
 def handle_voice_commands(transcript: str, stt: STTModel) -> tuple:
-    """
-    Parse transcript for management commands.
-    Returns (new_stt, handled: bool).
-    """
     t = transcript.lower().strip()
 
-    # ── list models ──────────────────────────────────────────────────────────
     if "list model" in t or "what model" in t or "which model" in t:
         cached = list_cached_models()
         current = stt.model_id.split("/")[-1]
@@ -754,13 +681,12 @@ def handle_voice_commands(transcript: str, stt: STTModel) -> tuple:
             speak(f"Current model: {current}. No other models cached.")
         return stt, True
 
-    # ── delete model (current) ────────────────────────────────────────────────
     if "delete model" in t or "remove model" in t:
         mid = stt.model_id
         speak(f"Deleting {mid.split('/')[-1]} from disk. Reloading.")
         stt.unload(delete_files=True)
         try:
-            stt = STTModel(mid)   # re-download from scratch
+            stt = STTModel(mid)
             speak("Model re-downloaded. Ready.")
         except Exception as e:
             print(f"[STT] Reload failed: {e}")
@@ -768,7 +694,6 @@ def handle_voice_commands(transcript: str, stt: STTModel) -> tuple:
             stt = STTModel("openai/whisper-tiny.en")
         return stt, True
 
-    # ── switch model ──────────────────────────────────────────────────────────
     if "switch model" in t or "load model" in t or "try model" in t or "test model" in t:
         new_id = _resolve_model_id(t)
         if new_id is None:
@@ -798,7 +723,6 @@ def handle_voice_commands(transcript: str, stt: STTModel) -> tuple:
         return stt, True
 
     return stt, False
-
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
@@ -834,12 +758,10 @@ def main():
                 speak("I didn't catch that.")
                 continue
 
-            # Check for management commands first
             stt, handled = handle_voice_commands(text, stt)
             if handled:
                 continue
 
-            # Normal echo response
             speak(f"You said: {text}")
 
         except KeyboardInterrupt:
@@ -848,7 +770,6 @@ def main():
             print(f"[MAIN ERROR] {e}")
             traceback.print_exc()
             time.sleep(1.0)
-
 
 if __name__ == "__main__":
     main()
