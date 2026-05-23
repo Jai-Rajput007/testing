@@ -254,6 +254,12 @@ def speak(text: str):
 
 # ── STT — model family detection & per-family pipelines ──────────────────────
 import torch
+import multiprocessing
+try:
+    torch.set_num_threads(multiprocessing.cpu_count())
+except Exception:
+    pass
+
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -340,10 +346,17 @@ class STTModel:
                 torch_dtype=self._dtype,
             )
         elif self.family == "moonshine":
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id, cache_dir=cache, trust_remote_code=True,
-                torch_dtype=self._dtype,
-            )
+            try:
+                self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                    model_id, cache_dir=cache, trust_remote_code=True,
+                    torch_dtype=self._dtype,
+                )
+            except Exception:
+                from transformers import AutoModel
+                self.model = AutoModel.from_pretrained(
+                    model_id, cache_dir=cache, trust_remote_code=True,
+                    torch_dtype=self._dtype,
+                )
         elif self.family == "whisper":
             try:
                 self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
