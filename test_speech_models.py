@@ -117,7 +117,8 @@ def speak(text: str):
         pass
 
 # ── STT Setup ─────────────────────────────────────────────────────────────────
-from transformers import pipeline
+import torch
+from transformers import AutoProcessor, AutoConfig, AutoModelForSpeechSeq2Seq, AutoModelForCTC, AutoModelForCausalLM
 
 class STTTester:
     def __init__(self, model_id=DEFAULT_STT_MODEL):
@@ -125,25 +126,70 @@ class STTTester:
         self.load_model(model_id)
         
     def load_model(self, model_id):
-        print(f"[STT] Loading Hugging Face model '{model_id}' on CPU...")
+        print(f"[STT] Loading Processor and Config for '{model_id}'...")
         self.model_id = model_id
-        # We specify cache_dir="./models" so it downloads locally to our models folder
-        self.pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model_id,
-            device="cpu",
-            model_kwargs={"cache_dir": "./models"}
-        )
-        print(f"[STT] Model '{model_id}' ready.")
+        
+        self.processor = AutoProcessor.from_pretrained(model_id, cache_dir="./models", trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_id, cache_dir="./models", trust_remote_code=True)
+        
+        architectures = getattr(config, "architectures", [""])
+        arch = architectures[0] if architectures else ""
+        print(f"[STT] Architecture detected: {arch}")
+        
+        if "CTC" in arch or "Wav2Vec2" in arch:
+            self.model = AutoModelForCTC.from_pretrained(model_id, cache_dir="./models", trust_remote_code=True)
+            self.is_seq2seq = False
+        else:
+            try:
+                self.model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, cache_dir="./models", trust_remote_code=True)
+            except Exception:
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(model_id, cache_dir="./models", trust_remote_code=True)
+                except Exception:
+                    # Fallback to generic AutoModel
+                    from transformers import AutoModel
+                    self.model = AutoModel.from_pretrained(model_id, cache_dir="./models", trust_remote_code=True)
+            self.is_seq2seq = True
+            
+        self.model.eval()
+        self.model.to("cpu")
+        print("[STT] Model loaded successfully.")
         
     def transcribe(self, audio_np: np.ndarray) -> str:
-        # Pipeline expects audio as dict or dict array for timestamps, but raw array works for simple audio
-        res = self.pipe(audio_np, generate_kwargs={"language": "english", "task": "transcribe"})
-        if isinstance(res, dict):
-            return res.get("text", "").strip()
-        elif isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
-            return res[0].get("text", "").strip()
-        return str(res)
+        # Prepare inputs robustly to avoid Granite's unexpected sampling_rate error
+        kwargs = {"return_tensors": "pt"}
+        
+        try:
+            inputs = self.processor(audio_np, sampling_rate=16000, **kwargs)
+        except TypeError:
+            # If the processor rejects sampling_rate (like Granite)
+            inputs = self.processor(audio_np, **kwargs)
+            
+        inputs = {k: v.to("cpu") for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+        
+        with torch.no_grad():
+            if self.is_seq2seq and hasattr(self.model, "generate"):
+                # Real-time cap: max tokens based on audio length
+                duration = len(audio_np) / 16000.0
+                max_new_tokens = max(int(duration * 6), 30) # Prevent CPU hanging on hallucination
+                
+                gen_kwargs = {"max_new_tokens": max_new_tokens}
+                
+                try:
+                    generated_ids = self.model.generate(**inputs, **gen_kwargs)
+                except Exception:
+                    # Fallback if specific generation kwargs fail
+                    generated_ids = self.model.generate(**inputs)
+                    
+                text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            else:
+                # CTC or non-generative models
+                outputs = self.model(**inputs)
+                logits = outputs.logits
+                predicted_ids = torch.argmax(logits, dim=-1)
+                text = self.processor.batch_decode(predicted_ids)[0]
+                
+        return text.strip()
 
 stt_tester = STTTester()
 
