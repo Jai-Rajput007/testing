@@ -87,8 +87,8 @@ VAD_THRESHOLD      = 0.025         # normalized RMS energy
 VAD_CONFIRM_CHUNKS = 3             # ~240 ms sustained to confirm real speech
 SPEECH_TIMEOUT_S   = 1.2           # silence after speech → stop recording
 MAX_RECORD_S       = 15.0          # hard cap
-TTS_ECHO_DRAIN_S   = 0.15          # extra drain window after _is_speaking clears
-TRANSCRIBE_TIMEOUT = 40.0          # inference wall-clock limit
+TRANSCRIBE_TIMEOUT = 60.0          # inference wall-clock limit (large models are slow on CPU)
+TTS_ECHO_DRAIN_S   = 0.20          # extra drain window after TTS finishes (speaker echo)
 
 MODELS_DIR       = "./models"
 PIPER_MODEL_NAME = "en_US-ryan-high"
@@ -490,14 +490,55 @@ class STTModel:
     # ── Granite Speech ────────────────────────────────────────────────────────
     def _infer_granite(self, audio_np: np.ndarray) -> str:
         """
-        GraniteSpeechPlusForConditionalGeneration is a multimodal LLM.
-        The processor requires BOTH audio AND a text prompt via apply_chat_template.
-        Passing audio alone raises: 'Invalid text provided' TypeError.
+        Handles two distinct Granite Speech model variants:
 
-        Output decoding:
-          - Decoder-only style: generated_ids includes prompt tokens → strip them
-          - Encoder-decoder style: generated_ids is already just the new tokens
+        granite-4.0-1b-speech  →  GraniteSpeechForConditionalGeneration
+          Standard encoder-decoder ASR: processor takes audio directly,
+          generates token IDs that are batch_decoded to text.
+          Does NOT use apply_chat_template.
+
+        granite-speech-4.1-2b-plus  →  GraniteSpeechPlusForConditionalGeneration
+          Multimodal LLM: processor REQUIRES apply_chat_template with both
+          audio and a text prompt. Decoder-only output includes prompt tokens
+          which must be stripped before decoding.
+
+        Detection: check model_id for "granite-4.0" vs "4.1" / "plus".
+        Fall back gracefully if either path raises an exception.
         """
+        duration       = len(audio_np) / SAMPLE_RATE
+        max_new_tokens = max(int(duration * 8), 32)
+
+        is_plus = ("4.1" in self.model_id or "plus" in self.model_id.lower())
+
+        if not is_plus:
+            # ── granite-4.0-*-speech: standard encoder-decoder ────────────────
+            try:
+                inputs = self.processor(
+                    audio_np,
+                    sampling_rate=SAMPLE_RATE,
+                    return_tensors="pt",
+                )
+                inputs = {k: v.to("cpu") for k, v in inputs.items()
+                          if isinstance(v, torch.Tensor)}
+                with torch.no_grad():
+                    generated_ids = self.model.generate(
+                        **inputs, max_new_tokens=max_new_tokens, do_sample=False
+                    )
+                try:
+                    text = self.processor.batch_decode(
+                        generated_ids, skip_special_tokens=True
+                    )[0]
+                except Exception:
+                    tokenizer = getattr(self.processor, "tokenizer", self.processor)
+                    text = tokenizer.batch_decode(
+                        generated_ids, skip_special_tokens=True
+                    )[0]
+                return text.strip()
+            except Exception as e:
+                print(f"[STT] granite-4.0 standard path failed ({e}), trying chat-template ...")
+                is_plus = True   # fall through to plus path
+
+        # ── granite-4.1-plus: multimodal chat-template ────────────────────────
         conversation = [
             {
                 "role": "user",
@@ -517,22 +558,17 @@ class STTModel:
         inputs = {k: v.to("cpu") for k, v in inputs.items()
                   if isinstance(v, torch.Tensor)}
 
-        duration       = len(audio_np) / SAMPLE_RATE
-        max_new_tokens = max(int(duration * 8), 32)
-
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs, max_new_tokens=max_new_tokens, do_sample=False
             )
 
-        # Strip prompt tokens if decoder-only style output
+        # Strip prompt tokens — decoder-only output includes them
         prompt_len = inputs["input_ids"].shape[-1]
-        if generated_ids.shape[-1] > prompt_len:
-            decode_ids = generated_ids[:, prompt_len:]
-        else:
-            decode_ids = generated_ids
+        decode_ids = (generated_ids[:, prompt_len:]
+                      if generated_ids.shape[-1] > prompt_len
+                      else generated_ids)
 
-        # Try processor.batch_decode; fall back to tokenizer directly
         try:
             text = self.processor.batch_decode(decode_ids, skip_special_tokens=True)[0]
         except Exception:
@@ -594,22 +630,31 @@ class STTModel:
 def transcribe_with_timeout(stt: STTModel, audio_np: np.ndarray) -> str:
     result = [""]
     exc    = [None]
+    done   = threading.Event()
 
     def _run():
         try:
             result[0] = stt.transcribe(audio_np)
         except Exception as e:
             exc[0] = e
+        finally:
+            done.set()
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
-    t.join(timeout=TRANSCRIBE_TIMEOUT)
 
-    if t.is_alive():
-        print(f"[STT] Inference timed out after {TRANSCRIBE_TIMEOUT}s — skipping.")
-        return ""
+    # Heartbeat: print elapsed every 5 s so the terminal shows progress
+    elapsed = 0
+    while not done.wait(timeout=5.0):
+        elapsed += 5
+        print(f"[STT] Still transcribing ... {elapsed}s / {TRANSCRIBE_TIMEOUT}s")
+        if elapsed >= TRANSCRIBE_TIMEOUT:
+            print(f"[STT] Inference timed out after {TRANSCRIBE_TIMEOUT}s — skipping.")
+            return ""
+
     if exc[0]:
         print(f"[STT ERROR] {exc[0]}")
+        traceback.print_exc()
         return ""
     return result[0]
 
@@ -677,22 +722,23 @@ def record_utterance() -> np.ndarray:
     Block until speech is detected, record until silence or MAX_RECORD_S.
     Returns float32 waveform normalised to [-1, 1].
 
-    TTS-echo guard (mirrors demo_gestures.py drain_queue() pattern):
-      - Phase 1 busy-waits while _is_speaking is set — no chunks counted
-      - Once TTS clears, drains the queue + sleeps TTS_ECHO_DRAIN_S to let
-        any remaining speaker echo flush through before counting begins
-      - Requires VAD_CONFIRM_CHUNKS consecutive above-threshold chunks to
-        confirm real speech (vs a transient pop or residual echo)
-      - Phase 2 records until SPEECH_TIMEOUT_S silence or MAX_RECORD_S cap
+    TTS-echo guard — mirrors demo_gestures.py drain_queue() pattern:
+      • Phase 1 busy-discards all chunks while _is_speaking is set
+      • On the TTS→silent transition: double-drain + TTS_ECHO_DRAIN_S sleep
+        so residual speaker echo physically arrives and is flushed BEFORE
+        the VAD onset counter starts (prevents false onset from echo)
+      • Requires VAD_CONFIRM_CHUNKS consecutive above-threshold chunks to
+        confirm real speech (~240 ms sustained, not a pop or echo tail)
+      • Phase 2 records until SPEECH_TIMEOUT_S silence or MAX_RECORD_S cap
     """
     silence_limit = max(1, round(SPEECH_TIMEOUT_S * SAMPLE_RATE / CHUNK_SIZE))
 
-    # Phase 1 — wait for TTS to finish, then for confirmed speech onset
+    # ── Phase 1: wait for TTS to finish, then confirmed speech onset ──────────
     speech_consec = 0
     was_speaking  = False
     while True:
         if _is_speaking.is_set():
-            # Robot is talking — discard everything and reset counter
+            # Robot is talking — discard everything and reset onset counter
             try:
                 _audio_q.get_nowait()
             except queue.Empty:
@@ -702,7 +748,7 @@ def record_utterance() -> np.ndarray:
             continue
 
         if was_speaking:
-            # TTS just finished — drain residual echo then reset
+            # TTS just finished — flush echo: drain → wait → drain again
             _drain_queue()
             time.sleep(TTS_ECHO_DRAIN_S)
             _drain_queue()
@@ -720,7 +766,7 @@ def record_utterance() -> np.ndarray:
             print("[VAD] Speech onset confirmed.")
             break
 
-    # Phase 2 — record until silence / hard cap
+    # ── Phase 2: record until silence / hard cap ──────────────────────────────
     frames         = [chunk]
     silence_chunks = 0
     deadline       = time.time() + MAX_RECORD_S
@@ -760,6 +806,11 @@ MODEL_ALIASES = {
     "moonshine base":         "UsefulSensors/moonshine-base",
     "granite":                "ibm-granite/granite-speech-4.1-2b-plus",
     "granite speech":         "ibm-granite/granite-speech-4.1-2b-plus",
+    "granite plus":           "ibm-granite/granite-speech-4.1-2b-plus",
+    "granite 4":              "ibm-granite/granite-4.0-1b-speech",
+    "granite 4.0":            "ibm-granite/granite-4.0-1b-speech",
+    "granite one":            "ibm-granite/granite-4.0-1b-speech",
+    "granite small":          "ibm-granite/granite-4.0-1b-speech",
     "wav2vec":                "facebook/wav2vec2-base-960h",
     "wav2vec2":               "facebook/wav2vec2-base-960h",
     "wav2vec large":          "facebook/wav2vec2-large-960h-lv60-self",
