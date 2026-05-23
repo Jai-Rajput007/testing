@@ -22,6 +22,7 @@ onboard mic and Piper TTS (ryan-high voice) for audio feedback.
   "switch model moonshine tiny"         → unload current, download+load moonshine-tiny
   "switch model granite"                → unload current, download+load granite-speech
   "switch model wav2vec"                → unload current, download+load wav2vec2-base
+  "switch model vosk"                   → download+load vosk-model-small-en-us
   "switch model <full/hf-id>"           → load any HuggingFace model by full ID
   "delete model"                        → delete current model files from disk, reload
   "list models"                         → speak which models are cached on disk
@@ -33,6 +34,7 @@ onboard mic and Piper TTS (ryan-high voice) for audio feedback.
   Granite Speech   ibm-granite/granite-speech-*
   Wav2Vec2 / CTC   facebook/wav2vec2-*, facebook/hubert-*
   SpeechT5         microsoft/speecht5_asr  (uses pipeline API)
+  Vosk             vosk-model-small-en-us-0.15 (uses vosk pip package)
   Generic fallback anything else with generate()
 
 ── Download & cache ─────────────────────────────────────────────────────────────
@@ -54,6 +56,7 @@ import socket
 import threading
 import queue
 import urllib.request
+import zipfile
 import traceback
 import numpy as np
 
@@ -107,6 +110,8 @@ PIPER_JSON_URL   = (
 )
 PIPER_ONNX_PATH  = f"{MODELS_DIR}/{PIPER_MODEL_NAME}.onnx"
 PIPER_JSON_PATH  = f"{MODELS_DIR}/{PIPER_MODEL_NAME}.onnx.json"
+
+VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_local_ip(interface: str) -> str:
@@ -165,6 +170,19 @@ def list_cached_models() -> list:
             else:
                 cached.append(parts[0])
     return cached
+
+def _download_vosk_model(model_id: str):
+    """Downloads and extracts the Vosk model from alphacephei."""
+    target_dir = model_cache_folder(model_id)
+    if os.path.isdir(target_dir):
+        return
+    print(f"[VOSK] Downloading {model_id} ...")
+    zip_path = os.path.join(MODELS_DIR, f"{model_id}.zip")
+    urllib.request.urlretrieve(VOSK_MODEL_URL, zip_path)
+    print(f"[VOSK] Extracting {model_id} ...")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(target_dir)
+    os.remove(zip_path)
 
 # ── Hardware Init ─────────────────────────────────────────────────────────────
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -270,6 +288,7 @@ from transformers import (
 def _detect_family(model_id: str, arch: str) -> str:
     mid = model_id.lower()
     arc = arch.lower()
+    if "vosk" in mid:           return "vosk"
     if "granite" in mid:        return "granite"
     if "moonshine" in mid:      return "moonshine"
     if "speecht5" in mid:       return "speecht5"
@@ -307,8 +326,30 @@ class STTModel:
         cache = MODELS_DIR
         print(f"\n[STT] ── Loading '{model_id}' ──")
         print(f"[STT] Cache folder : {model_cache_folder(model_id)}")
-        print(f"[STT] torch dtype  : {self._dtype}")
+        
+        self.family = _detect_family(model_id, "")
+        
+        if self.family == "vosk":
+            _download_vosk_model(model_id)
+            try:
+                import vosk
+            except ImportError:
+                print("\n[STT] Vosk is not installed. Please run `pip install vosk`.\n[STT] Falling back to whisper tiny...")
+                self.model_id = "openai/whisper-tiny.en"
+                self._load(self.model_id)
+                return
 
+            model_path = os.path.join(model_cache_folder(model_id), model_id)
+            vosk.SetLogLevel(-1)
+            self.model = vosk.Model(model_path)
+            self.processor = None
+            self.pipeline = None
+            size_mb = model_disk_size_mb(model_id)
+            print(f"[STT] '{model_id}' ready. Disk: {size_mb:.0f} MB")
+            return
+
+        # ── Hugging Face fallback loading ──
+        print(f"[STT] torch dtype  : {self._dtype}")
         print("[STT] Loading processor/config ...")
         try:
             self.processor = AutoProcessor.from_pretrained(
@@ -415,7 +456,9 @@ class STTModel:
 
     def transcribe(self, audio_np: np.ndarray) -> str:
         try:
-            if self.family == "granite":
+            if self.family == "vosk":
+                return self._infer_vosk(audio_np)
+            elif self.family == "granite":
                 return self._infer_granite(audio_np)
             elif self.family == "moonshine":
                 return self._infer_moonshine(audio_np)
@@ -429,6 +472,16 @@ class STTModel:
             print(f"[STT ERROR] transcribe() raised: {e}")
             traceback.print_exc()
             return ""
+            
+    # ── Vosk ──────────────────────────────────────────────────────────────────
+    def _infer_vosk(self, audio_np: np.ndarray) -> str:
+        import vosk
+        # Convert float32 [-1.0, 1.0] back to int16 PCM expected by Kaldi
+        pcm_data = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        rec = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
+        rec.AcceptWaveform(pcm_data)
+        res = json.loads(rec.FinalResult())
+        return res.get("text", "").strip()
 
     # ── Granite Speech (granite-4.0-1b-speech AND granite-speech-4.1-*) ──────
     def _infer_granite(self, audio_np: np.ndarray) -> str:
@@ -439,12 +492,10 @@ class STTModel:
             chat, tokenize=False, add_generation_prompt=True
         )
 
-        # [CRITICAL FIX] 
-        # Properly supplying kwargs for Hugging Face Granite Processor
         try:
             model_inputs = self.processor(
                 text=prompt_text,
-                audio=audio_np,       # standard HF audio kwarg
+                audio=audio_np,       
                 return_tensors="pt",
                 sampling_rate=SAMPLE_RATE,
             )
@@ -452,13 +503,11 @@ class STTModel:
             try:
                 model_inputs = self.processor(
                     text=prompt_text,
-                    audios=audio_np,  # alternative HF audio kwarg
+                    audios=audio_np,  
                     return_tensors="pt",
                     sampling_rate=SAMPLE_RATE,
                 )
             except Exception:
-                # If kwargs completely fail, fallback to positionals
-                # Note: PyTorch tensors might be expected instead of numpy directly 
                 wav_tensor = torch.from_numpy(audio_np)
                 model_inputs = self.processor(
                     prompt_text,
@@ -521,9 +570,6 @@ class STTModel:
     def _infer_pipeline(self, audio_np: np.ndarray) -> str:
         result = self.pipeline({"array": audio_np, "sampling_rate": SAMPLE_RATE})
         return result.get("text", "").strip()
-
-
-
 
 
 # ── Mic multicast receiver ────────────────────────────────────────────────────
@@ -640,6 +686,8 @@ MODEL_ALIASES = {
     "speecht5":               "microsoft/speecht5_asr",
     "speech t5":              "microsoft/speecht5_asr",
     "hubert":                 "facebook/hubert-large-ls960-ft",
+    "vosk":                   "vosk-model-small-en-us-0.15",
+    "vosk small":             "vosk-model-small-en-us-0.15",
 }
 
 def _resolve_model_id(text: str) -> str | None:
