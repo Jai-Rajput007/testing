@@ -87,6 +87,7 @@ VAD_THRESHOLD      = 0.025         # normalized RMS energy
 VAD_CONFIRM_CHUNKS = 3             # ~240 ms sustained to confirm real speech
 SPEECH_TIMEOUT_S   = 1.2           # silence after speech → stop recording
 MAX_RECORD_S       = 15.0          # hard cap
+TTS_ECHO_DRAIN_S   = 0.15          # extra drain window after _is_speaking clears
 TRANSCRIBE_TIMEOUT = 40.0          # inference wall-clock limit
 
 MODELS_DIR       = "./models"
@@ -676,21 +677,41 @@ def record_utterance() -> np.ndarray:
     Block until speech is detected, record until silence or MAX_RECORD_S.
     Returns float32 waveform normalised to [-1, 1].
 
-    Mirrors demo_gestures.py robustness:
-      • Drains stale/TTS-echo frames before listening
-      • Requires VAD_CONFIRM_CHUNKS consecutive above-threshold chunks to start
-      • Stops on SPEECH_TIMEOUT_S of silence or MAX_RECORD_S hard cap
-      • Ignores all frames while TTS is playing (_is_speaking guard)
+    TTS-echo guard (mirrors demo_gestures.py drain_queue() pattern):
+      - Phase 1 busy-waits while _is_speaking is set — no chunks counted
+      - Once TTS clears, drains the queue + sleeps TTS_ECHO_DRAIN_S to let
+        any remaining speaker echo flush through before counting begins
+      - Requires VAD_CONFIRM_CHUNKS consecutive above-threshold chunks to
+        confirm real speech (vs a transient pop or residual echo)
+      - Phase 2 records until SPEECH_TIMEOUT_S silence or MAX_RECORD_S cap
     """
-    _drain_queue()
     silence_limit = max(1, round(SPEECH_TIMEOUT_S * SAMPLE_RATE / CHUNK_SIZE))
 
-    # Phase 1 — wait for confirmed speech onset
+    # Phase 1 — wait for TTS to finish, then for confirmed speech onset
     speech_consec = 0
+    was_speaking  = False
     while True:
-        chunk = _audio_q.get()
         if _is_speaking.is_set():
-            continue                 # ignore mic while robot is speaking
+            # Robot is talking — discard everything and reset counter
+            try:
+                _audio_q.get_nowait()
+            except queue.Empty:
+                time.sleep(0.01)
+            speech_consec = 0
+            was_speaking  = True
+            continue
+
+        if was_speaking:
+            # TTS just finished — drain residual echo then reset
+            _drain_queue()
+            time.sleep(TTS_ECHO_DRAIN_S)
+            _drain_queue()
+            was_speaking  = False
+            speech_consec = 0
+            print("[VAD] TTS echo cleared, now listening ...")
+            continue
+
+        chunk = _audio_q.get()
         if _vad_prob(chunk) >= VAD_THRESHOLD:
             speech_consec += 1
         else:
