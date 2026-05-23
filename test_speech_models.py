@@ -13,7 +13,8 @@ import numpy as np
 os.makedirs("models", exist_ok=True)
 
 # Fix for scikit-learn OpenMP TLS allocation error (copied from demo_gestures)
-os.environ['LD_PRELOAD'] = '/home/unitree/miniconda3/envs/demo/lib/python3.10/site-packages/scikit_learn.libs/libgomp-947d5fa1.so.1.0.0'
+# Removed as it was causing LD_PRELOAD errors in this environment
+# os.environ['LD_PRELOAD'] = '/home/unitree/miniconda3/envs/demo/lib/python3.10/site-packages/scikit_learn.libs/libgomp-947d5fa1.so.1.0.0'
 
 # ── Config ────────────────────────────────────────────────────────────────────
 NETWORK_INTERFACE = sys.argv[1] if len(sys.argv) > 1 else "enP8p1s0"
@@ -137,7 +138,7 @@ class STTTester:
         
     def transcribe(self, audio_np: np.ndarray) -> str:
         # Pipeline expects audio as dict or dict array for timestamps, but raw array works for simple audio
-        res = self.pipe(audio_np)
+        res = self.pipe(audio_np, generate_kwargs={"language": "english", "task": "transcribe"})
         if isinstance(res, dict):
             return res.get("text", "").strip()
         elif isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
