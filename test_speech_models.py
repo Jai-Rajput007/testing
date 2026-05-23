@@ -87,7 +87,7 @@ VAD_THRESHOLD      = 0.025         # normalized RMS energy
 VAD_CONFIRM_CHUNKS = 3             # ~240 ms sustained to confirm real speech
 SPEECH_TIMEOUT_S   = 1.2           # silence after speech → stop recording
 MAX_RECORD_S       = 15.0          # hard cap
-TRANSCRIBE_TIMEOUT = 60.0          # inference wall-clock limit (large models are slow on CPU)
+TRANSCRIBE_TIMEOUT = 60.0          # inference wall-clock limit (large models slow on CPU)
 TTS_ECHO_DRAIN_S   = 0.20          # extra drain window after TTS finishes (speaker echo)
 
 MODELS_DIR       = "./models"
@@ -490,81 +490,64 @@ class STTModel:
     # ── Granite Speech ────────────────────────────────────────────────────────
     def _infer_granite(self, audio_np: np.ndarray) -> str:
         """
-        Handles two distinct Granite Speech model variants:
+        Correct inference path for ALL granite speech models
+        (granite-4.0-1b-speech AND granite-speech-4.1-*-plus).
 
-        granite-4.0-1b-speech  →  GraniteSpeechForConditionalGeneration
-          Standard encoder-decoder ASR: processor takes audio directly,
-          generates token IDs that are batch_decoded to text.
-          Does NOT use apply_chat_template.
+        Official API (from IBM model cards):
+          1. tokenizer.apply_chat_template(chat, tokenize=False)
+             → produces a plain text prompt STRING containing <|audio|>
+             The <|audio|> token is the placeholder — it tells the model
+             where to inject the audio features. Without it in the prompt,
+             tokens=0 and features=N → "Audio features and audio tokens do
+             not match" crash.
+          2. processor(prompt_string, wav_tensor, return_tensors="pt")
+             → encodes both text + audio together into model_inputs
+          3. model.generate(**model_inputs, ...)
+             → output includes prompt tokens; strip them before decoding
 
-        granite-speech-4.1-2b-plus  →  GraniteSpeechPlusForConditionalGeneration
-          Multimodal LLM: processor REQUIRES apply_chat_template with both
-          audio and a text prompt. Decoder-only output includes prompt tokens
-          which must be stripped before decoding.
-
-        Detection: check model_id for "granite-4.0" vs "4.1" / "plus".
-        Fall back gracefully if either path raises an exception.
+        The old approach called processor.apply_chat_template() directly
+        and never passed audio through the processor — causing tokens=0.
         """
-        duration       = len(audio_np) / SAMPLE_RATE
-        max_new_tokens = max(int(duration * 8), 32)
+        import torch
 
-        is_plus = ("4.1" in self.model_id or "plus" in self.model_id.lower())
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        duration   = len(audio_np) / SAMPLE_RATE
 
-        if not is_plus:
-            # ── granite-4.0-*-speech: standard encoder-decoder ────────────────
-            try:
-                inputs = self.processor(
-                    audio_np,
-                    sampling_rate=SAMPLE_RATE,
-                    return_tensors="pt",
-                )
-                inputs = {k: v.to("cpu") for k, v in inputs.items()
-                          if isinstance(v, torch.Tensor)}
-                with torch.no_grad():
-                    generated_ids = self.model.generate(
-                        **inputs, max_new_tokens=max_new_tokens, do_sample=False
-                    )
-                try:
-                    text = self.processor.batch_decode(
-                        generated_ids, skip_special_tokens=True
-                    )[0]
-                except Exception:
-                    tokenizer = getattr(self.processor, "tokenizer", self.processor)
-                    text = tokenizer.batch_decode(
-                        generated_ids, skip_special_tokens=True
-                    )[0]
-                return text.strip()
-            except Exception as e:
-                print(f"[STT] granite-4.0 standard path failed ({e}), trying chat-template ...")
-                is_plus = True   # fall through to plus path
-
-        # ── granite-4.1-plus: multimodal chat-template ────────────────────────
-        conversation = [
+        # Build chat prompt — <|audio|> MUST be in the content string
+        # so the processor inserts the right number of audio placeholder tokens
+        chat = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "audio", "audio": audio_np},
-                    {"type": "text",  "text":  "Transcribe the speech in this audio clip."},
-                ],
+                "content": "<|audio|>Transcribe the speech into written text.",
             }
         ]
-        inputs = self.processor.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_tensors="pt",
-            return_dict=True,
+        prompt_text = tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
         )
-        inputs = {k: v.to("cpu") for k, v in inputs.items()
-                  if isinstance(v, torch.Tensor)}
+
+        # Convert numpy float32 → torch tensor (processor expects [1, T] or 1-D)
+        wav_tensor = torch.from_numpy(audio_np).unsqueeze(0)   # [1, T]
+
+        # processor encodes BOTH text and audio into model inputs
+        model_inputs = self.processor(
+            prompt_text,
+            wav_tensor,
+            device="cpu",
+            return_tensors="pt",
+            sampling_rate=SAMPLE_RATE,
+        )
+        model_inputs = {k: v.to("cpu") for k, v in model_inputs.items()
+                        if isinstance(v, torch.Tensor)}
+
+        max_new_tokens = max(int(duration * 8), 32)
 
         with torch.no_grad():
             generated_ids = self.model.generate(
-                **inputs, max_new_tokens=max_new_tokens, do_sample=False
+                **model_inputs, max_new_tokens=max_new_tokens, do_sample=False
             )
 
-        # Strip prompt tokens — decoder-only output includes them
-        prompt_len = inputs["input_ids"].shape[-1]
+        # Strip prompt tokens (decoder-only style — output includes them)
+        prompt_len = model_inputs["input_ids"].shape[-1]
         decode_ids = (generated_ids[:, prompt_len:]
                       if generated_ids.shape[-1] > prompt_len
                       else generated_ids)
@@ -572,7 +555,6 @@ class STTModel:
         try:
             text = self.processor.batch_decode(decode_ids, skip_special_tokens=True)[0]
         except Exception:
-            tokenizer = getattr(self.processor, "tokenizer", self.processor)
             text = tokenizer.batch_decode(decode_ids, skip_special_tokens=True)[0]
 
         return text.strip()
@@ -640,10 +622,9 @@ def transcribe_with_timeout(stt: STTModel, audio_np: np.ndarray) -> str:
         finally:
             done.set()
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    threading.Thread(target=_run, daemon=True).start()
 
-    # Heartbeat: print elapsed every 5 s so the terminal shows progress
+    # Print elapsed every 5 s so the terminal shows the model is working
     elapsed = 0
     while not done.wait(timeout=5.0):
         elapsed += 5
@@ -738,7 +719,7 @@ def record_utterance() -> np.ndarray:
     was_speaking  = False
     while True:
         if _is_speaking.is_set():
-            # Robot is talking — discard everything and reset onset counter
+            # Robot is talking — discard everything, reset onset counter
             try:
                 _audio_q.get_nowait()
             except queue.Empty:
