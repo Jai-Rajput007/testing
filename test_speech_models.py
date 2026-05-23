@@ -87,8 +87,9 @@ VAD_THRESHOLD      = 0.025         # normalized RMS energy
 VAD_CONFIRM_CHUNKS = 3             # ~240 ms sustained to confirm real speech
 SPEECH_TIMEOUT_S   = 1.2           # silence after speech → stop recording
 MAX_RECORD_S       = 15.0          # hard cap
-TRANSCRIBE_TIMEOUT = 60.0          # inference wall-clock limit (large models slow on CPU)
-TTS_ECHO_DRAIN_S   = 0.20          # extra drain window after TTS finishes (speaker echo)
+TRANSCRIBE_TIMEOUT = 120.0         # wall-clock inference limit (2B model on CPU is slow)
+TTS_ECHO_DRAIN_S   = 0.20          # extra silence after TTS clears before VAD starts
+USE_BFLOAT16       = True          # halves RAM and inference time on CPU (ARM-safe)
 
 MODELS_DIR       = "./models"
 PIPER_MODEL_NAME = "en_US-ryan-high"
@@ -269,89 +270,84 @@ from transformers import (
 )
 
 def _detect_family(model_id: str, arch: str) -> str:
-    """
-    Map a model to one of our inference pipelines.
-
-    Priority: explicit model-ID substring check first (most reliable),
-    then fall back to architecture class name from config.
-    """
     mid = model_id.lower()
     arc = arch.lower()
-
-    if "granite" in mid:              return "granite"
-    if "moonshine" in mid:            return "moonshine"
-    if "speecht5" in mid:             return "speecht5"
-    if "whisper" in mid:              return "whisper"
-    if "wav2vec2" in mid:             return "ctc"
-    if "hubert" in mid:               return "ctc"
-    if "wav2vec" in mid:              return "ctc"
-
-    # Architecture fallbacks
-    if "ctc" in arc:                  return "ctc"
-    if "wav2vec" in arc:              return "ctc"
-    if "speechseq2seq" in arc:        return "whisper"
-    if "whisper" in arc:              return "whisper"
-    if "moonshine" in arc:            return "moonshine"
-
-    # Anything else with generate() → generic seq2seq
+    if "granite" in mid:        return "granite"
+    if "moonshine" in mid:      return "moonshine"
+    if "speecht5" in mid:       return "speecht5"
+    if "whisper" in mid:        return "whisper"
+    if "wav2vec2" in mid:       return "ctc"
+    if "hubert" in mid:         return "ctc"
+    if "wav2vec" in mid:        return "ctc"
+    if "ctc" in arc:            return "ctc"
+    if "wav2vec" in arc:        return "ctc"
+    if "speechseq2seq" in arc:  return "whisper"
+    if "whisper" in arc:        return "whisper"
+    if "moonshine" in arc:      return "moonshine"
     return "seq2seq"
+
+
+def _torch_dtype():
+    """bfloat16 halves RAM and speeds up inference on ARM CPU. Falls back to float32."""
+    if USE_BFLOAT16:
+        try:
+            # Quick check that bfloat16 ops work on this CPU
+            _ = torch.zeros(1, dtype=torch.bfloat16) + torch.zeros(1, dtype=torch.bfloat16)
+            return torch.bfloat16
+        except Exception:
+            print("[STT] bfloat16 not supported on this CPU, falling back to float32.")
+    return torch.float32
 
 
 class STTModel:
     """
     Unified wrapper for any HuggingFace speech-to-text model.
 
-    ── Download behaviour ────────────────────────────────────────────────────
-    All models are saved to ./models/ using HuggingFace's standard
-    cache layout:  models/models--<org>--<model-name>/snapshots/<hash>/
+    Models saved to ./models/ in HuggingFace cache layout.
 
-    ── Family-specific notes ─────────────────────────────────────────────────
-    granite   GraniteSpeechPlus is a multimodal LLM. The processor MUST
-              receive audio + a text prompt via apply_chat_template.
-              Passing audio alone → 'Invalid text provided' TypeError.
+    ── Family inference paths ────────────────────────────────────────────────
+    granite   Official IBM API (same for granite-4.0-1b-speech AND 4.1-2b-plus):
+                1. tokenizer.apply_chat_template(chat, tokenize=False)
+                   → plain text string with <|audio|> placeholder
+                2. processor(prompt_string, wav_tensor, return_tensors="pt")
+                   → encodes text + audio together; <|audio|> determines
+                   how many audio feature slots are created (must match
+                   number of encoder output frames — "tokens: 0, features: N"
+                   crash means <|audio|> was missing or processor skipped)
+                3. model.generate(**inputs) → strip input_ids length from
+                   output, decode with tokenizer.batch_decode
+              Loaded with AutoModelForSpeechSeq2Seq + bfloat16.
 
-    moonshine Uses AutoModelForCausalLM + processor.decode() (singular).
-              Does NOT use batch_decode.
+    moonshine AutoModelForCausalLM; processor.decode() (not batch_decode).
 
-    whisper   AutoModelForSpeechSeq2Seq + processor.batch_decode.
+    whisper   AutoModelForSpeechSeq2Seq; processor.batch_decode.
 
-    ctc       AutoModelForCTC → argmax(logits) → processor.batch_decode.
+    ctc       AutoModelForCTC; argmax(logits); processor.batch_decode.
 
-    speecht5  Uses transformers pipeline("automatic-speech-recognition")
-              which handles its unique speaker-embedding requirement.
+    speecht5  transformers.pipeline() (handles speaker embeddings internally).
 
-    seq2seq   Generic fallback for any other model with generate().
+    seq2seq   Generic fallback with generate().
     """
 
     def __init__(self, model_id: str):
         self.model_id  = model_id
         self.model     = None
         self.processor = None
-        self.pipeline  = None   # used for speecht5 and pipeline-only models
+        self.pipeline  = None
         self.family    = None
+        self._dtype    = _torch_dtype()
         self._load(model_id)
 
-    # ── Download progress callback ────────────────────────────────────────────
-    @staticmethod
-    def _print_download_progress(block_num, block_size, total_size):
-        if total_size > 0:
-            pct = min(block_num * block_size * 100 / total_size, 100)
-            mb  = block_num * block_size / (1024 * 1024)
-            print(f"\r[DL] {pct:.1f}%  {mb:.1f} MB", end="", flush=True)
-
-    # ── Load ──────────────────────────────────────────────────────────────────
     def _load(self, model_id: str):
         cache = MODELS_DIR
         print(f"\n[STT] ── Loading '{model_id}' ──")
-        print(f"[STT] Cache folder: {model_cache_folder(model_id)}")
+        print(f"[STT] Cache folder : {model_cache_folder(model_id)}")
+        print(f"[STT] torch dtype  : {self._dtype}")
 
-        # --- Processor + Config (needed for family detection) -----------------
-        print(f"[STT] Downloading processor/config ...")
+        print("[STT] Loading processor/config ...")
         try:
             self.processor = AutoProcessor.from_pretrained(
-                model_id,
-                cache_dir=cache,
-                trust_remote_code=True,
+                model_id, cache_dir=cache, trust_remote_code=True,
             )
         except Exception as e:
             print(f"[STT] AutoProcessor failed ({e}), trying pipeline fallback ...")
@@ -361,14 +357,13 @@ class STTModel:
         config = AutoConfig.from_pretrained(
             model_id, cache_dir=cache, trust_remote_code=True
         )
-        archs      = getattr(config, "architectures", [""]) or [""]
-        arch       = archs[0] if archs else ""
+        archs       = getattr(config, "architectures", [""]) or [""]
+        arch        = archs[0] if archs else ""
         self.family = _detect_family(model_id, arch)
-        print(f"[STT] Architecture: {arch}")
-        print(f"[STT] Pipeline family: {self.family}")
+        print(f"[STT] Architecture : {arch}")
+        print(f"[STT] Family       : {self.family}")
 
-        # --- Model weights ----------------------------------------------------
-        print(f"[STT] Downloading model weights (this may take a while) ...")
+        print("[STT] Loading model weights ...")
 
         if self.family == "speecht5":
             self._load_as_pipeline(model_id, cache)
@@ -376,55 +371,47 @@ class STTModel:
 
         if self.family == "ctc":
             self.model = AutoModelForCTC.from_pretrained(
-                model_id, cache_dir=cache, trust_remote_code=True
+                model_id, cache_dir=cache, trust_remote_code=True,
+                torch_dtype=self._dtype,
             )
         elif self.family == "granite":
-            # GraniteSpeechPlus is its own model class — not registered under
-            # AutoModelForCausalLM. Must use AutoModel with trust_remote_code
-            # so transformers resolves it to GraniteSpeechPlusForConditionalGeneration.
-            from transformers import AutoModel
-            try:
-                self.model = AutoModel.from_pretrained(
-                    model_id, cache_dir=cache, trust_remote_code=True
-                )
-            except Exception as e1:
-                print(f"[STT] AutoModel failed ({e1}), trying AutoModelForSpeechSeq2Seq ...")
-                try:
-                    self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                        model_id, cache_dir=cache, trust_remote_code=True
-                    )
-                except Exception as e2:
-                    print(f"[STT] Seq2Seq failed ({e2}), using pipeline fallback ...")
-                    self._load_as_pipeline(model_id, cache)
-                    return
+            # Both granite-4.0-1b-speech and granite-speech-4.1-*-plus register
+            # as AutoModelForSpeechSeq2Seq in transformers ≥ 4.52.1
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_id, cache_dir=cache, trust_remote_code=True,
+                torch_dtype=self._dtype,
+            )
         elif self.family == "moonshine":
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_id, cache_dir=cache, trust_remote_code=True
+                model_id, cache_dir=cache, trust_remote_code=True,
+                torch_dtype=self._dtype,
             )
         elif self.family == "whisper":
             try:
                 self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    model_id, cache_dir=cache, trust_remote_code=True
+                    model_id, cache_dir=cache, trust_remote_code=True,
+                    torch_dtype=self._dtype,
                 )
             except Exception:
-                # Some Whisper variants only register as CausalLM
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id, cache_dir=cache, trust_remote_code=True
+                    model_id, cache_dir=cache, trust_remote_code=True,
+                    torch_dtype=self._dtype,
                 )
         else:
-            # Generic seq2seq — try Seq2Seq first, fall back to CausalLM
             try:
                 self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    model_id, cache_dir=cache, trust_remote_code=True
+                    model_id, cache_dir=cache, trust_remote_code=True,
+                    torch_dtype=self._dtype,
                 )
             except Exception as e1:
-                print(f"[STT] Seq2Seq load failed ({e1}), trying CausalLM ...")
+                print(f"[STT] Seq2Seq failed ({e1}), trying CausalLM ...")
                 try:
                     self.model = AutoModelForCausalLM.from_pretrained(
-                        model_id, cache_dir=cache, trust_remote_code=True
+                        model_id, cache_dir=cache, trust_remote_code=True,
+                        torch_dtype=self._dtype,
                     )
                 except Exception as e2:
-                    print(f"[STT] CausalLM load failed ({e2}), using pipeline ...")
+                    print(f"[STT] CausalLM failed ({e2}), using pipeline ...")
                     self._load_as_pipeline(model_id, cache)
                     return
 
@@ -434,12 +421,8 @@ class STTModel:
         print(f"[STT] '{model_id}' ready. Disk: {size_mb:.0f} MB")
 
     def _load_as_pipeline(self, model_id: str, cache: str):
-        """
-        Last-resort loader using transformers.pipeline().
-        Handles models like SpeechT5 or anything with a non-standard processor.
-        """
         from transformers import pipeline
-        print(f"[STT] Loading via transformers.pipeline ...")
+        print("[STT] Loading via transformers.pipeline ...")
         self.pipeline = pipeline(
             "automatic-speech-recognition",
             model=model_id,
@@ -450,26 +433,18 @@ class STTModel:
         self.family = "pipeline"
         print(f"[STT] '{model_id}' loaded via pipeline.")
 
-    # ── Unload (free RAM) ─────────────────────────────────────────────────────
     def unload(self, delete_files: bool = False):
         mid = self.model_id
-        if self.model is not None:
-            del self.model;     self.model     = None
-        if self.processor is not None:
-            del self.processor; self.processor = None
-        if self.pipeline is not None:
-            del self.pipeline;  self.pipeline  = None
+        if self.model     is not None: del self.model;     self.model     = None
+        if self.processor is not None: del self.processor; self.processor = None
+        if self.pipeline  is not None: del self.pipeline;  self.pipeline  = None
         gc.collect()
         print(f"[STT] '{mid}' unloaded from RAM.")
         if delete_files:
             delete_model_files(mid)
 
-    # ── Transcribe (public) ───────────────────────────────────────────────────
     def transcribe(self, audio_np: np.ndarray) -> str:
-        """
-        audio_np : float32 waveform normalised to [-1, 1], 16 kHz mono.
-        Returns  : transcribed string (empty string on any failure).
-        """
+        """audio_np: float32 [-1,1] at 16 kHz mono. Returns transcribed string."""
         try:
             if self.family == "granite":
                 return self._infer_granite(audio_np)
@@ -480,108 +455,87 @@ class STTModel:
             elif self.family == "pipeline":
                 return self._infer_pipeline(audio_np)
             else:
-                # whisper + seq2seq share the same path
                 return self._infer_seq2seq(audio_np)
         except Exception as e:
             print(f"[STT ERROR] transcribe() raised: {e}")
             traceback.print_exc()
             return ""
 
-    # ── Granite Speech ────────────────────────────────────────────────────────
+    # ── Granite Speech (granite-4.0-1b-speech AND granite-speech-4.1-*) ──────
     def _infer_granite(self, audio_np: np.ndarray) -> str:
         """
-        Correct inference path for ALL granite speech models
-        (granite-4.0-1b-speech AND granite-speech-4.1-*-plus).
+        Correct API from official IBM model cards (transformers ≥ 4.52.1):
 
-        Official API (from IBM model cards):
-          1. tokenizer.apply_chat_template(chat, tokenize=False)
-             → produces a plain text prompt STRING containing <|audio|>
-             The <|audio|> token is the placeholder — it tells the model
-             where to inject the audio features. Without it in the prompt,
-             tokens=0 and features=N → "Audio features and audio tokens do
-             not match" crash.
-          2. processor(prompt_string, wav_tensor, return_tensors="pt")
-             → encodes both text + audio together into model_inputs
-          3. model.generate(**model_inputs, ...)
-             → output includes prompt tokens; strip them before decoding
+          Step 1 — build prompt TEXT STRING containing <|audio|>
+            The <|audio|> token tells the processor how many audio feature
+            slots to reserve. If it's absent → tokens=0, features=N → crash.
+            Use tokenizer.apply_chat_template(..., tokenize=False) to get
+            the raw string; do NOT pass tokenize=True or return_dict=True.
 
-        The old approach called processor.apply_chat_template() directly
-        and never passed audio through the processor — causing tokens=0.
+          Step 2 — processor(prompt_string, wav_tensor, return_tensors="pt")
+            Pass the text string AND a [1,T] float32 torch tensor together.
+            The processor aligns the audio features with the <|audio|> slots.
+            Do NOT pass a numpy array — processor expects a torch tensor.
+
+          Step 3 — model.generate(**inputs, ...)
+            Output includes the full prompt tokens. Strip them:
+              new_tokens = outputs[0, input_ids.shape[-1]:]
+            Decode with tokenizer.batch_decode (not processor.batch_decode).
         """
-        import torch
+        tokenizer = self.processor.tokenizer
 
-        tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        duration   = len(audio_np) / SAMPLE_RATE
-
-        # Build chat prompt — <|audio|> MUST be in the content string
-        # so the processor inserts the right number of audio placeholder tokens
-        chat = [
-            {
-                "role": "user",
-                "content": "<|audio|>Transcribe the speech into written text.",
-            }
-        ]
+        # Step 1: text prompt — <|audio|> MUST be in the content
+        chat = [{"role": "user", "content": "<|audio|>Transcribe the speech into written text."}]
         prompt_text = tokenizer.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=True
         )
 
-        # Convert numpy float32 → torch tensor (processor expects [1, T] or 1-D)
-        wav_tensor = torch.from_numpy(audio_np).unsqueeze(0)   # [1, T]
+        # Step 2: wav tensor [1, T] float32 — processor needs torch, not numpy
+        wav_tensor = torch.from_numpy(audio_np).unsqueeze(0)  # [1, T]
 
-        # processor encodes BOTH text and audio into model inputs
         model_inputs = self.processor(
             prompt_text,
             wav_tensor,
-            device="cpu",
             return_tensors="pt",
             sampling_rate=SAMPLE_RATE,
         )
+        # Move all tensor inputs to CPU (already there, but explicit is safer)
         model_inputs = {k: v.to("cpu") for k, v in model_inputs.items()
                         if isinstance(v, torch.Tensor)}
 
+        duration       = len(audio_np) / SAMPLE_RATE
         max_new_tokens = max(int(duration * 8), 32)
 
+        # Step 3: generate + strip prompt tokens + decode
         with torch.no_grad():
-            generated_ids = self.model.generate(
-                **model_inputs, max_new_tokens=max_new_tokens, do_sample=False
+            outputs = self.model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
             )
 
-        # Strip prompt tokens (decoder-only style — output includes them)
-        prompt_len = model_inputs["input_ids"].shape[-1]
-        decode_ids = (generated_ids[:, prompt_len:]
-                      if generated_ids.shape[-1] > prompt_len
-                      else generated_ids)
-
-        try:
-            text = self.processor.batch_decode(decode_ids, skip_special_tokens=True)[0]
-        except Exception:
-            text = tokenizer.batch_decode(decode_ids, skip_special_tokens=True)[0]
-
+        num_input_tokens = model_inputs["input_ids"].shape[-1]
+        new_tokens = outputs[0, num_input_tokens:].unsqueeze(0)
+        text = tokenizer.batch_decode(
+            new_tokens, add_special_tokens=False, skip_special_tokens=True
+        )[0]
         return text.strip()
 
     # ── Moonshine ─────────────────────────────────────────────────────────────
     def _infer_moonshine(self, audio_np: np.ndarray) -> str:
-        inputs = self.processor(
-            audio_np, return_tensors="pt", sampling_rate=SAMPLE_RATE
-        )
-        inputs = {k: v.to("cpu") for k, v in inputs.items()
-                  if isinstance(v, torch.Tensor)}
+        inputs = self.processor(audio_np, return_tensors="pt", sampling_rate=SAMPLE_RATE)
+        inputs = {k: v.to("cpu") for k, v in inputs.items() if isinstance(v, torch.Tensor)}
         duration       = len(audio_np) / SAMPLE_RATE
         max_new_tokens = max(int(duration * 5), 16)
         with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs, max_new_tokens=max_new_tokens
-            )
-        # processor.decode (not batch_decode) is the documented Moonshine path
+            generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
         return self.processor.decode(generated_ids[0], skip_special_tokens=True).strip()
 
     # ── Whisper / generic Seq2Seq ─────────────────────────────────────────────
     def _infer_seq2seq(self, audio_np: np.ndarray) -> str:
-        inputs = self.processor(
-            audio_np, return_tensors="pt", sampling_rate=SAMPLE_RATE
-        )
-        inputs = {k: v.to("cpu") for k, v in inputs.items()
-                  if isinstance(v, torch.Tensor)}
+        inputs = self.processor(audio_np, return_tensors="pt", sampling_rate=SAMPLE_RATE)
+        inputs = {k: v.to("cpu") for k, v in inputs.items() if isinstance(v, torch.Tensor)}
         duration       = len(audio_np) / SAMPLE_RATE
         max_new_tokens = max(int(duration * 6), 30)
         with torch.no_grad():
@@ -590,11 +544,8 @@ class STTModel:
 
     # ── CTC / Wav2Vec2 ────────────────────────────────────────────────────────
     def _infer_ctc(self, audio_np: np.ndarray) -> str:
-        inputs = self.processor(
-            audio_np, return_tensors="pt", sampling_rate=SAMPLE_RATE
-        )
-        inputs = {k: v.to("cpu") for k, v in inputs.items()
-                  if isinstance(v, torch.Tensor)}
+        inputs = self.processor(audio_np, return_tensors="pt", sampling_rate=SAMPLE_RATE)
+        inputs = {k: v.to("cpu") for k, v in inputs.items() if isinstance(v, torch.Tensor)}
         with torch.no_grad():
             logits   = self.model(**inputs).logits
             pred_ids = torch.argmax(logits, dim=-1)
@@ -602,13 +553,11 @@ class STTModel:
 
     # ── pipeline() fallback ───────────────────────────────────────────────────
     def _infer_pipeline(self, audio_np: np.ndarray) -> str:
-        result = self.pipeline(
-            {"array": audio_np, "sampling_rate": SAMPLE_RATE}
-        )
+        result = self.pipeline({"array": audio_np, "sampling_rate": SAMPLE_RATE})
         return result.get("text", "").strip()
 
 
-# ── Transcription with wall-clock timeout ─────────────────────────────────────
+# ── Transcription with wall-clock timeout & heartbeat ────────────────────────
 def transcribe_with_timeout(stt: STTModel, audio_np: np.ndarray) -> str:
     result = [""]
     exc    = [None]
@@ -624,7 +573,6 @@ def transcribe_with_timeout(stt: STTModel, audio_np: np.ndarray) -> str:
 
     threading.Thread(target=_run, daemon=True).start()
 
-    # Print elapsed every 5 s so the terminal shows the model is working
     elapsed = 0
     while not done.wait(timeout=5.0):
         elapsed += 5
@@ -703,42 +651,21 @@ def record_utterance() -> np.ndarray:
     Block until speech is detected, record until silence or MAX_RECORD_S.
     Returns float32 waveform normalised to [-1, 1].
 
-    TTS-echo guard — mirrors demo_gestures.py drain_queue() pattern:
-      • Phase 1 busy-discards all chunks while _is_speaking is set
-      • On the TTS→silent transition: double-drain + TTS_ECHO_DRAIN_S sleep
-        so residual speaker echo physically arrives and is flushed BEFORE
-        the VAD onset counter starts (prevents false onset from echo)
-      • Requires VAD_CONFIRM_CHUNKS consecutive above-threshold chunks to
-        confirm real speech (~240 ms sustained, not a pop or echo tail)
-      • Phase 2 records until SPEECH_TIMEOUT_S silence or MAX_RECORD_S cap
+    Mirrors demo_gestures.py robustness:
+      • Drains stale/TTS-echo frames before listening
+      • Requires VAD_CONFIRM_CHUNKS consecutive above-threshold chunks to start
+      • Stops on SPEECH_TIMEOUT_S of silence or MAX_RECORD_S hard cap
+      • Ignores all frames while TTS is playing (_is_speaking guard)
     """
+    _drain_queue()
     silence_limit = max(1, round(SPEECH_TIMEOUT_S * SAMPLE_RATE / CHUNK_SIZE))
 
-    # ── Phase 1: wait for TTS to finish, then confirmed speech onset ──────────
+    # Phase 1 — wait for confirmed speech onset
     speech_consec = 0
-    was_speaking  = False
     while True:
-        if _is_speaking.is_set():
-            # Robot is talking — discard everything, reset onset counter
-            try:
-                _audio_q.get_nowait()
-            except queue.Empty:
-                time.sleep(0.01)
-            speech_consec = 0
-            was_speaking  = True
-            continue
-
-        if was_speaking:
-            # TTS just finished — flush echo: drain → wait → drain again
-            _drain_queue()
-            time.sleep(TTS_ECHO_DRAIN_S)
-            _drain_queue()
-            was_speaking  = False
-            speech_consec = 0
-            print("[VAD] TTS echo cleared, now listening ...")
-            continue
-
         chunk = _audio_q.get()
+        if _is_speaking.is_set():
+            continue                 # ignore mic while robot is speaking
         if _vad_prob(chunk) >= VAD_THRESHOLD:
             speech_consec += 1
         else:
@@ -747,7 +674,7 @@ def record_utterance() -> np.ndarray:
             print("[VAD] Speech onset confirmed.")
             break
 
-    # ── Phase 2: record until silence / hard cap ──────────────────────────────
+    # Phase 2 — record until silence / hard cap
     frames         = [chunk]
     silence_chunks = 0
     deadline       = time.time() + MAX_RECORD_S
@@ -787,11 +714,6 @@ MODEL_ALIASES = {
     "moonshine base":         "UsefulSensors/moonshine-base",
     "granite":                "ibm-granite/granite-speech-4.1-2b-plus",
     "granite speech":         "ibm-granite/granite-speech-4.1-2b-plus",
-    "granite plus":           "ibm-granite/granite-speech-4.1-2b-plus",
-    "granite 4":              "ibm-granite/granite-4.0-1b-speech",
-    "granite 4.0":            "ibm-granite/granite-4.0-1b-speech",
-    "granite one":            "ibm-granite/granite-4.0-1b-speech",
-    "granite small":          "ibm-granite/granite-4.0-1b-speech",
     "wav2vec":                "facebook/wav2vec2-base-960h",
     "wav2vec2":               "facebook/wav2vec2-base-960h",
     "wav2vec large":          "facebook/wav2vec2-large-960h-lv60-self",
