@@ -377,7 +377,26 @@ class STTModel:
             self.model = AutoModelForCTC.from_pretrained(
                 model_id, cache_dir=cache, trust_remote_code=True
             )
-        elif self.family in ("granite", "moonshine"):
+        elif self.family == "granite":
+            # GraniteSpeechPlus is its own model class — not registered under
+            # AutoModelForCausalLM. Must use AutoModel with trust_remote_code
+            # so transformers resolves it to GraniteSpeechPlusForConditionalGeneration.
+            from transformers import AutoModel
+            try:
+                self.model = AutoModel.from_pretrained(
+                    model_id, cache_dir=cache, trust_remote_code=True
+                )
+            except Exception as e1:
+                print(f"[STT] AutoModel failed ({e1}), trying AutoModelForSpeechSeq2Seq ...")
+                try:
+                    self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                        model_id, cache_dir=cache, trust_remote_code=True
+                    )
+                except Exception as e2:
+                    print(f"[STT] Seq2Seq failed ({e2}), using pipeline fallback ...")
+                    self._load_as_pipeline(model_id, cache)
+                    return
+        elif self.family == "moonshine":
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_id, cache_dir=cache, trust_remote_code=True
             )
@@ -470,10 +489,13 @@ class STTModel:
     # ── Granite Speech ────────────────────────────────────────────────────────
     def _infer_granite(self, audio_np: np.ndarray) -> str:
         """
-        Granite Speech is a multimodal LLM.
-        Processor requires BOTH an audio tensor AND a text prompt.
-        Build the prompt via apply_chat_template, then strip the prompt tokens
-        from the output so we only decode the newly generated ASR text.
+        GraniteSpeechPlusForConditionalGeneration is a multimodal LLM.
+        The processor requires BOTH audio AND a text prompt via apply_chat_template.
+        Passing audio alone raises: 'Invalid text provided' TypeError.
+
+        Output decoding:
+          - Decoder-only style: generated_ids includes prompt tokens → strip them
+          - Encoder-decoder style: generated_ids is already just the new tokens
         """
         conversation = [
             {
@@ -502,10 +524,21 @@ class STTModel:
                 **inputs, max_new_tokens=max_new_tokens, do_sample=False
             )
 
-        # Decode only the new tokens (not the prompt)
+        # Strip prompt tokens if decoder-only style output
         prompt_len = inputs["input_ids"].shape[-1]
-        new_ids    = generated_ids[:, prompt_len:]
-        return self.processor.batch_decode(new_ids, skip_special_tokens=True)[0].strip()
+        if generated_ids.shape[-1] > prompt_len:
+            decode_ids = generated_ids[:, prompt_len:]
+        else:
+            decode_ids = generated_ids
+
+        # Try processor.batch_decode; fall back to tokenizer directly
+        try:
+            text = self.processor.batch_decode(decode_ids, skip_special_tokens=True)[0]
+        except Exception:
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            text = tokenizer.batch_decode(decode_ids, skip_special_tokens=True)[0]
+
+        return text.strip()
 
     # ── Moonshine ─────────────────────────────────────────────────────────────
     def _infer_moonshine(self, audio_np: np.ndarray) -> str:
