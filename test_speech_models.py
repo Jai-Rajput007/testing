@@ -86,8 +86,7 @@ CHUNK_SIZE         = 1280          # 80 ms @ 16 kHz
 VAD_THRESHOLD      = 0.025         # normalized RMS energy
 VAD_CONFIRM_CHUNKS = 3             # ~240 ms sustained to confirm real speech
 SPEECH_TIMEOUT_S   = 1.2           # silence after speech → stop recording
-MAX_RECORD_S       = 15.0          # hard cap
-TRANSCRIBE_TIMEOUT = 120.0         # wall-clock inference limit (2B model on CPU is slow)
+MAX_RECORD_S       = 8.0           # hard cap
 TTS_ECHO_DRAIN_S   = 0.20          # extra silence after TTS clears before VAD starts
 
 # [CRITICAL FIX]
@@ -524,35 +523,7 @@ class STTModel:
         return result.get("text", "").strip()
 
 
-# ── Transcription with wall-clock timeout & heartbeat ────────────────────────
-def transcribe_with_timeout(stt: STTModel, audio_np: np.ndarray) -> str:
-    result = [""]
-    exc    = [None]
-    done   = threading.Event()
 
-    def _run():
-        try:
-            result[0] = stt.transcribe(audio_np)
-        except Exception as e:
-            exc[0] = e
-        finally:
-            done.set()
-
-    threading.Thread(target=_run, daemon=True).start()
-
-    elapsed = 0
-    while not done.wait(timeout=5.0):
-        elapsed += 5
-        print(f"[STT] Still transcribing ... {elapsed}s / {TRANSCRIBE_TIMEOUT}s")
-        if elapsed >= TRANSCRIBE_TIMEOUT:
-            print(f"[STT] Inference timed out after {TRANSCRIBE_TIMEOUT}s — skipping.")
-            return ""
-
-    if exc[0]:
-        print(f"[STT ERROR] {exc[0]}")
-        traceback.print_exc()
-        return ""
-    return result[0]
 
 
 # ── Mic multicast receiver ────────────────────────────────────────────────────
@@ -763,7 +734,7 @@ def main():
             print(f"[TEST] Recorded {duration:.2f}s — transcribing ...")
 
             t0   = time.time()
-            text = transcribe_with_timeout(stt, audio_np)
+            text = stt.transcribe(audio_np)
             elapsed = time.time() - t0
             print(f"[STT Result] '{text}'  ({elapsed:.2f}s)")
 
