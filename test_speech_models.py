@@ -699,6 +699,7 @@ def main():
                 print(f"\n[STANDBY] Waiting for wake word '{WAKEWORD_MODEL}' ...")
                 _drain_queue()
                 consec = 0
+                _log_counter = 0
                 triggered = False
                 while not triggered:
                     chunk = _audio_q.get()
@@ -706,15 +707,19 @@ def main():
                         continue
                     
                     scores = oww_model.predict(chunk)
-                    # For custom models, the dict key is usually the base name of the model without extension ("maya")
                     score = float(max(scores.values(), default=0.0))
                     
-                    if score > 0.5:
+                    _log_counter += 1
+                    if score > 0.05 or _log_counter % 25 == 0:
+                        energy = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768.0
+                        print(f"[STANDBY] score={score:.3f}  energy={energy:.3f}", flush=True)
+                    
+                    if score >= 0.3:
                         consec += 1
                     else:
                         consec = 0
                         
-                    if consec >= 2:
+                    if consec >= 1:
                         print(f"[WAKEWORD] Triggered! Score: {score:.3f}")
                         speak("Yes?")
                         oww_model.reset()
