@@ -702,13 +702,22 @@ def main():
                 print(f"[WAKEWORD ERROR] {local_jarvis} not found in the current directory!")
             else:
                 try:
-                    from openwakeword.model import Model as OWWModel
-                    import openwakeword
-                    openwakeword.utils.download_models()
-                    oww_model = OWWModel(wakeword_models=[local_jarvis], inference_framework="onnx")
-                    print(f"[WAKEWORD] Hey Jarvis loaded successfully.")
+                    # Trying the livekit.wakeword engine just like test.py
+                    from livekit.wakeword import WakeWordModel
+                    oww_model = WakeWordModel(models=[local_jarvis])
+                    print(f"[WAKEWORD] Hey Jarvis loaded successfully via livekit.wakeword!")
+                except ImportError:
+                    print("[WAKEWORD] livekit.wakeword not found, falling back to openwakeword...")
+                    try:
+                        from openwakeword.model import Model as OWWModel
+                        import openwakeword
+                        openwakeword.utils.download_models()
+                        oww_model = OWWModel(wakeword_models=[local_jarvis])
+                        print(f"[WAKEWORD] Hey Jarvis loaded successfully via openwakeword!")
+                    except Exception as e:
+                        print(f"[WAKEWORD ERROR] Failed to load jarvis: {e}")
                 except Exception as e:
-                    print(f"[WAKEWORD ERROR] Failed to load jarvis: {e}")
+                    print(f"[WAKEWORD ERROR] Failed to load jarvis via livekit: {e}")
 
     speak(
         f"Speech testing ready. "
