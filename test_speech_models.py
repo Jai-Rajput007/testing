@@ -710,9 +710,7 @@ def main():
                     print("[WAKEWORD] livekit.wakeword not found, falling back to openwakeword...")
                     try:
                         from openwakeword.model import Model as OWWModel
-                        import openwakeword
-                        openwakeword.utils.download_models()
-                        oww_model = OWWModel(wakeword_models=[local_jarvis])
+                        oww_model = OWWModel(wakeword_models=[local_jarvis],enable_speex_noise_suppression=False,)
                         print(f"[WAKEWORD] Hey Jarvis loaded successfully via openwakeword!")
                     except Exception as e:
                         print(f"[WAKEWORD ERROR] Failed to load jarvis: {e}")
