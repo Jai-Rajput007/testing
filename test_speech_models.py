@@ -685,6 +685,16 @@ def main():
             except Exception as e:
                 print(f"[WAKEWORD ERROR] Failed to load model: {e}")
                 print("[WAKEWORD ERROR] Falling back to continuous VAD recording.")
+        elif WAKEWORD_MODEL.lower() == "alexa":
+            print("[WAKEWORD] Loading openwakeword with default 'alexa' model ...")
+            try:
+                from openwakeword.model import Model as OWWModel
+                import openwakeword
+                openwakeword.utils.download_models()
+                oww_model = OWWModel(wakeword_models=["alexa"], inference_framework="onnx")
+                print(f"[WAKEWORD] Alexa wake word loaded successfully.")
+            except Exception as e:
+                print(f"[WAKEWORD ERROR] Failed to load alexa: {e}")
 
     speak(
         f"Speech testing ready. "
