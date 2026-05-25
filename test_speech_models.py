@@ -695,6 +695,20 @@ def main():
                 print(f"[WAKEWORD] Alexa wake word loaded successfully.")
             except Exception as e:
                 print(f"[WAKEWORD ERROR] Failed to load alexa: {e}")
+        elif WAKEWORD_MODEL.lower() == "jarvis":
+            print("[WAKEWORD] Loading local custom model 'hey_jarvis.onnx' ...")
+            local_jarvis = "./hey_jarvis.onnx"
+            if not os.path.exists(local_jarvis):
+                print(f"[WAKEWORD ERROR] {local_jarvis} not found in the current directory!")
+            else:
+                try:
+                    from openwakeword.model import Model as OWWModel
+                    import openwakeword
+                    openwakeword.utils.download_models()
+                    oww_model = OWWModel(wakeword_models=[local_jarvis], inference_framework="onnx")
+                    print(f"[WAKEWORD] Hey Jarvis loaded successfully.")
+                except Exception as e:
+                    print(f"[WAKEWORD ERROR] Failed to load jarvis: {e}")
 
     speak(
         f"Speech testing ready. "
@@ -724,7 +738,8 @@ def main():
                         energy = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768.0
                         print(f"[STANDBY] score={score:.3f}  energy={energy:.3f}", flush=True)
                     
-                    if score >= 0.3:
+                    threshold = 0.7 if WAKEWORD_MODEL.lower() == "jarvis" else 0.3
+                    if score >= threshold:
                         consec += 1
                     else:
                         consec = 0
