@@ -111,8 +111,6 @@ PIPER_JSON_URL   = (
 PIPER_ONNX_PATH  = f"{MODELS_DIR}/{PIPER_MODEL_NAME}.onnx"
 PIPER_JSON_PATH  = f"{MODELS_DIR}/{PIPER_MODEL_NAME}.onnx.json"
 
-VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_local_ip(interface: str) -> str:
     import subprocess
@@ -176,9 +174,10 @@ def _download_vosk_model(model_id: str):
     target_dir = model_cache_folder(model_id)
     if os.path.isdir(target_dir):
         return
-    print(f"[VOSK] Downloading {model_id} ...")
+    print(f"[VOSK] Downloading {model_id} (this may take a while for large models)...")
     zip_path = os.path.join(MODELS_DIR, f"{model_id}.zip")
-    urllib.request.urlretrieve(VOSK_MODEL_URL, zip_path)
+    url = f"https://alphacephei.com/vosk/models/{model_id}.zip"
+    urllib.request.urlretrieve(url, zip_path)
     print(f"[VOSK] Extracting {model_id} ...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(target_dir)
@@ -688,6 +687,7 @@ MODEL_ALIASES = {
     "hubert":                 "facebook/hubert-large-ls960-ft",
     "vosk":                   "vosk-model-small-en-us-0.15",
     "vosk small":             "vosk-model-small-en-us-0.15",
+    "vosk large":             "vosk-model-en-us-0.22",
 }
 
 def _resolve_model_id(text: str) -> str | None:
