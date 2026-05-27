@@ -735,6 +735,13 @@ def ask_ollama(prompt: str) -> str:
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
+    global DEFAULT_STT_MODEL
+    # Resolve initial CLI alias if present
+    for alias, hf_id in MODEL_ALIASES.items():
+        if DEFAULT_STT_MODEL.lower() == alias.lower():
+            DEFAULT_STT_MODEL = hf_id
+            break
+
     print(f"\n[TEST] ══ STT Benchmark ══")
     print(f"[TEST] Model : {DEFAULT_STT_MODEL}")
     print(f"[TEST] Keep models on disk: {KEEP_MODELS}")
