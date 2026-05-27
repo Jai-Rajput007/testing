@@ -481,13 +481,17 @@ class STTModel:
 
     def _infer_nemo(self, audio_np: np.ndarray) -> str:
         try:
-            if "canary" in self.model_id.lower():
-                try:
+            # Safely handle the keyword name change across NeMo versions
+            try:
+                if "canary" in self.model_id.lower():
+                    outputs = self.model.transcribe(audio=[audio_np], batch_size=1, task="asr", source_lang="en", target_lang="en")
+                else:
+                    outputs = self.model.transcribe(audio=[audio_np])
+            except TypeError:
+                if "canary" in self.model_id.lower():
                     outputs = self.model.transcribe(paths2audio_files=[audio_np], batch_size=1, task="asr", source_lang="en", target_lang="en")
-                except TypeError:
+                else:
                     outputs = self.model.transcribe(paths2audio_files=[audio_np])
-            else:
-                outputs = self.model.transcribe(paths2audio_files=[audio_np])
             
             if not outputs:
                 return ""
