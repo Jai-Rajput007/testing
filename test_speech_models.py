@@ -269,6 +269,10 @@ from transformers import (
 def _detect_family(model_id: str, arch: str) -> str:
     mid = model_id.lower()
     arc = arch.lower()
+    if "parakeet" in mid:       return "nemo"
+    if "canary" in mid:         return "nemo"
+    if "nemotron" in mid:       return "nemo"
+    if "nemo" in mid:           return "nemo"
     if "vosk" in mid:           return "vosk"
     if "granite" in mid:        return "granite"
     if "moonshine" in mid:      return "moonshine"
@@ -310,6 +314,39 @@ class STTModel:
         
         self.family = _detect_family(model_id, "")
         
+        if self.family == "nemo":
+            try:
+                import nemo.collections.asr as nemo_asr
+            except ImportError:
+                print("\n[STT] NeMo Toolkit is not installed. Please run `pip install \"nemo_toolkit[asr]\"`.\n[STT] Falling back to whisper tiny...")
+                self.model_id = "openai/whisper-tiny.en"
+                self._load(self.model_id)
+                return
+
+            print("[STT] Loading NeMo ASRModel ...")
+            try:
+                self.model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_id)
+            except Exception as e:
+                print(f"[STT ERROR] Failed to load NeMo model {model_id}: {e}")
+                print("[STT] Falling back to whisper tiny...")
+                self.model_id = "openai/whisper-tiny.en"
+                self._load(self.model_id)
+                return
+                
+            self.model.eval()
+            
+            # NeMo models default to GPU if available, perfect for AGX Thor
+            import torch
+            if torch.cuda.is_available():
+                self.model.to("cuda")
+                print("[STT] NeMo model moved to CUDA.")
+            else:
+                self.model.to("cpu")
+                
+            size_mb = model_disk_size_mb(model_id)
+            print(f"[STT] '{model_id}' ready. Disk: {size_mb:.0f} MB")
+            return
+
         if self.family == "vosk":
             _download_vosk_model(model_id)
             try:
@@ -423,7 +460,9 @@ class STTModel:
 
     def transcribe(self, audio_np: np.ndarray) -> str:
         try:
-            if self.family == "vosk":
+            if self.family == "nemo":
+                return self._infer_nemo(audio_np)
+            elif self.family == "vosk":
                 return self._infer_vosk(audio_np)
             elif self.family == "granite":
                 return self._infer_granite(audio_np)
@@ -438,6 +477,29 @@ class STTModel:
         except Exception as e:
             print(f"[STT ERROR] transcribe() raised: {e}")
             traceback.print_exc()
+            return ""
+
+    def _infer_nemo(self, audio_np: np.ndarray) -> str:
+        try:
+            if "canary" in self.model_id.lower():
+                try:
+                    outputs = self.model.transcribe(paths2audio_files=[audio_np], batch_size=1, task="asr", source_lang="en", target_lang="en")
+                except TypeError:
+                    outputs = self.model.transcribe(paths2audio_files=[audio_np])
+            else:
+                outputs = self.model.transcribe(paths2audio_files=[audio_np])
+            
+            if not outputs:
+                return ""
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+                
+            first = outputs[0]
+            if isinstance(first, dict) and "text" in first:
+                return str(first["text"]).strip()
+            return str(first).strip()
+        except Exception as e:
+            print(f"[NEMO ERROR] {e}")
             return ""
             
     def _infer_vosk(self, audio_np: np.ndarray) -> str:
@@ -599,6 +661,11 @@ MODEL_ALIASES = {
     "moonshine tiny":         "UsefulSensors/moonshine-streaming-tiny",
     "moonshine base":         "UsefulSensors/moonshine-streaming-base",
     "moonshine medium":       "UsefulSensors/moonshine-streaming-medium",
+    "parakeet v2":            "nvidia/parakeet-tdt-0.6b-v2",
+    "parakeet v3":            "nvidia/parakeet-tdt-0.6b-v3",
+    "parakeet":               "nvidia/parakeet-tdt-0.6b-v3",
+    "canary":                 "nvidia/canary-1b-v2",
+    "nemotron":               "nvidia/nemotron-asr-streaming",
     "granite":                "ibm-granite/granite-speech-4.1-2b-plus",
     "wav2vec":                "facebook/wav2vec2-base-960h",
     "speecht5":               "microsoft/speecht5_asr",
@@ -649,6 +716,22 @@ def handle_voice_commands(transcript: str, stt: STTModel) -> tuple:
         return stt, True
 
     return stt, False
+
+def ask_ollama(prompt: str) -> str:
+    try:
+        import ollama
+        print(f"[OLLAMA] Thinking...")
+        response = ollama.chat(model='qwen2.5:7b', messages=[
+            {'role': 'system', 'content': 'You are the brain of a robot. Keep answers extremely short and conversational, preferably 1 or 2 sentences max.'},
+            {'role': 'user', 'content': prompt}
+        ])
+        return response['message']['content'].strip()
+    except ImportError:
+        print("[OLLAMA] 'ollama' python package not found. (pip install ollama)")
+        return f"You said: {prompt}"
+    except Exception as e:
+        print(f"[OLLAMA ERROR] {e}")
+        return f"You said: {prompt}"
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
@@ -781,7 +864,9 @@ def main():
             if handled:
                 continue
 
-            speak(f"You said: {text}")
+            # Ollama Reasoning Engine replaces standard Echo
+            answer = ask_ollama(text)
+            speak(answer)
 
         except KeyboardInterrupt:
             _cleanup()
